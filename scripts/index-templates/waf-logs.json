@@ -1,0 +1,22 @@
+{
+  "index_patterns": ["waf-logs-*"],
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0,
+      "index.refresh_interval": "5s"
+    },
+    "mappings": {
+      "properties": {
+        "@timestamp": { "type": "date" },
+        "unique_id": { "type": "keyword" },
+        "rule_id": { "type": "keyword" },
+        "severity": { "type": "keyword" },
+        "msg": { "type": "text", "fields": { "keyword": { "type": "keyword", "ignore_above": 256 } } },
+        "client_ip": { "type": "ip" },
+        "uri": { "type": "text", "fields": { "keyword": { "type": "keyword", "ignore_above": 1024 } } },
+        "action": { "type": "keyword" }
+      }
+    }
+  }
+}

@@ -1,0 +1,475 @@
+# =============================================================================
+# coreX Logging Pipeline — Vector configuration
+# =============================================================================
+# Collects HAProxy request logs via TCP syslog and WAF (Coraza SPOA) logs via
+# file tailing, FULLY decodes JA4 / req_fp / unique_id into human-readable
+# structured sub-fields, and ships to two separate OpenSearch indices.
+#
+# Requires:
+#   - HAProxy LogDestination with target "tcp+vector:601" (created via
+#     scripts/create-logdestination.sh or the coreX UI)
+#   - haproxy-data volume mounted read-only at /app/data (for WAF log tailing)
+#   - OpenSearch running and healthy
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Sources
+# ---------------------------------------------------------------------------
+
+# HAProxy request logs via UDP syslog.
+# HAProxy's `log` directive sends via UDP by default. The `len 65535` option
+# in the HAProxy config allows datagrams up to 65535 bytes, so large JSON
+# log-format lines are not truncated.
+#   log vector:514 len 65535 local0 info
+[sources.haproxy_syslog]
+type = "syslog"
+address = "0.0.0.0:514"
+mode = "udp"
+
+# WAF (Coraza SPOA) logs via file tailing.
+# Coraza SPOA writes one JSON event per line to /app/data/coraza-spoa.log.
+# The file is on the shared haproxy-data volume (mounted read-only).
+# The corex_manager WAF sampler prunes this file in-place (ftruncate, not
+# os.replace) so the inode is preserved and Vector can tail it reliably.
+[sources.waf_file]
+type = "file"
+include = ["/app/data/coraza-spoa.log"]
+read_from = "beginning"
+fingerprint.strategy = "checksum"
+fingerprint.lines = 1
+
+# ---------------------------------------------------------------------------
+# HAProxy transforms: parse JSON -> decode JA4 -> decode req_fp -> set doc ID
+# ---------------------------------------------------------------------------
+
+# Parse the syslog message body as JSON (HAProxy emits a JSON log-format string)
+[transforms.haproxy_parse_json]
+type = "remap"
+inputs = ["haproxy_syslog"]
+source = '''
+# The syslog source puts the HAProxy JSON log line in .message
+parsed, err = parse_json(.message)
+if err == null {
+  . = merge!(., parsed)
+} else {
+  # Record parse errors so they're visible in OpenSearch Discover instead
+  # of silently dropping into the unparsed bucket. This makes JSON parse
+  # failures (e.g. from unescaped special chars in URLs) diagnosable.
+  ._parse_error = to_string(err)
+}
+# Preserve syslog metadata under _syslog_ prefix for debugging
+._syslog_facility = to_string(.facility) ?? ""
+._syslog_severity = to_string(.severity) ?? ""
+._syslog_hostname = to_string(.hostname) ?? ""
+
+# HAProxy sends "-" for numeric fields when no value is available (e.g. WAF
+# fields when no WAF rules matched, timing fields for error responses).
+# OpenSearch rejects "-" for integer/long-mapped fields, so convert to null.
+if (to_string(.waf_anomaly_score) ?? "") == "-" { .waf_anomaly_score = null }
+if (to_string(.waf_rule_id) ?? "") == "-" { .waf_rule_id = null }
+if (to_string(.risk_score) ?? "") == "-" { .risk_score = null }
+if (to_string(.risk_rules_hit_count) ?? "") == "-" { .risk_rules_hit_count = null }
+if (to_string(.be_response_time) ?? "") == "-" { .be_response_time = null }
+if (to_string(.be_connect_time) ?? "") == "-" { .be_connect_time = null }
+if (to_string(.total_time) ?? "") == "-" { .total_time = null }
+if (to_string(.bytes_out) ?? "") == "-" { .bytes_out = null }
+if (to_string(.status) ?? "") == "-" { .status = null }
+if (to_string(.client_port) ?? "") == "-" { .client_port = null }
+if (to_string(.unique_id_client_port) ?? "") == "-" { .unique_id_client_port = null }
+if (to_string(.unique_id_timestamp) ?? "") == "-" { .unique_id_timestamp = null }
+if (to_string(.unique_id_request_counter) ?? "") == "-" { .unique_id_request_counter = null }
+if (to_string(.unique_id_pid) ?? "") == "-" { .unique_id_pid = null }
+if (to_string(.ja4_cipher_count) ?? "") == "-" { .ja4_cipher_count = null }
+if (to_string(.ja4_ext_count) ?? "") == "-" { .ja4_ext_count = null }
+if (to_string(.req_fp_path_depth) ?? "") == "-" { .req_fp_path_depth = null }
+if (to_string(.req_fp_hdr_count) ?? "") == "-" { .req_fp_hdr_count = null }
+if (to_string(.req_fp_status) ?? "") == "-" { .req_fp_status = null }
+if (to_string(.req_fp_body_bytes) ?? "") == "-" { .req_fp_body_bytes = null }
+
+# xff (X-Forwarded-For) is a string; the json converter emits "-" when missing.
+if (to_string(.xff) ?? "") == "-" { .xff = null }
+
+# referer is a string; the json converter emits "-" when missing.
+if (to_string(.referer) ?? "") == "-" { .referer = null }
+
+# Common timestamp field for cross-index correlation (combined index pattern).
+# HAProxy's ts field is in format "03/Sep/2026:01:28:04.092" — parse to ISO 8601,
+# then drop the redundant source time fields.
+ts_raw = to_string(.ts) ?? ""
+if ts_raw != "" {
+  parsed_ts, parse_err = parse_timestamp(ts_raw, format: "%d/%b/%Y:%H:%M:%S%.3f")
+  if parse_err == null {
+    .@timestamp = to_string(parsed_ts)
+  } else {
+    .@timestamp = now()
+  }
+} else {
+  .@timestamp = now()
+}
+# Drop redundant source time fields; @timestamp is the canonical one.
+del(.ts)
+del(.timestamp)
+'''
+
+# Decode JA4 fingerprint into structured, human-readable sub-fields.
+#
+# JA4 format: {proto}{version}{sni}{cipher_count}{ext_count}{alpn}_{cipher_hash}_{ext_hash}
+# Example:    t13d1516h2_8daaf6152771_b186095e22b6
+#
+# JA4_a is 10 chars: proto(1) + version(2) + sni(1) + cipher_count(2) + ext_count(2) + alpn(2)
+#
+# Decode mappings (from FoxIO JA4 spec + ja4.lua source):
+#   proto:  t=TLS, d=DTLS, q=QUIC
+#   version: 13=TLSv1.3, 12=TLSv1.2, 11=TLSv1.1, 10=TLSv1.0,
+#            s3=SSLv3, s2=SSLv2, d1=DTLSv1.0, d2=DTLSv1.2, d3=DTLSv1.3
+#   sni:    d=domain (SNI present), i=ip (no SNI)
+#   alpn:   00=none, otherwise first+last char of ALPN (e.g. h2)
+[transforms.decode_ja4]
+type = "remap"
+inputs = ["haproxy_parse_json"]
+source = '''
+if !exists(.ja4) || .ja4 == null || .ja4 == "" || .ja4 == "-" {
+  .ja4 = ""
+} else {
+  parts = split!(.ja4, "_")
+  if length(parts) >= 3 {
+    a = to_string(parts[0])
+    .ja4_a = a
+    .ja4_b = to_string(parts[1])
+    .ja4_c = to_string(parts[2])
+
+    # Split JA4_a into its 6 components (only if long enough)
+    if length(a) >= 10 {
+      .ja4_proto = slice!(a, start: 0, end: 1)
+      .ja4_version = slice!(a, start: 1, end: 3)
+      .ja4_sni = slice!(a, start: 3, end: 4)
+      .ja4_cipher_count = to_int(slice!(a, start: 4, end: 6)) ?? 0
+      .ja4_ext_count = to_int(slice!(a, start: 6, end: 8)) ?? 0
+      .ja4_alpn = slice!(a, start: 8, end: 10)
+      .ja4_cipher_hash = parts[1]
+      .ja4_ext_hash = parts[2]
+    }
+  }
+
+  # Decode proto to human-readable protocol name
+  if .ja4_proto == "t" {
+    .ja4_protocol = "TLS"
+  } else if .ja4_proto == "d" {
+    .ja4_protocol = "DTLS"
+  } else if .ja4_proto == "q" {
+    .ja4_protocol = "QUIC"
+  } else {
+    .ja4_protocol = .ja4_proto
+  }
+
+  # Decode version to human-readable TLS version
+  if .ja4_version == "13" {
+    .ja4_tls_version = "TLSv1.3"
+  } else if .ja4_version == "12" {
+    .ja4_tls_version = "TLSv1.2"
+  } else if .ja4_version == "11" {
+    .ja4_tls_version = "TLSv1.1"
+  } else if .ja4_version == "10" {
+    .ja4_tls_version = "TLSv1.0"
+  } else if .ja4_version == "s3" {
+    .ja4_tls_version = "SSLv3"
+  } else if .ja4_version == "s2" {
+    .ja4_tls_version = "SSLv2"
+  } else if .ja4_version == "d1" {
+    .ja4_tls_version = "DTLSv1.0"
+  } else if .ja4_version == "d2" {
+    .ja4_tls_version = "DTLSv1.2"
+  } else if .ja4_version == "d3" {
+    .ja4_tls_version = "DTLSv1.3"
+  } else {
+    .ja4_tls_version = .ja4_version
+  }
+
+  # Decode SNI presence
+  if .ja4_sni == "d" {
+    .ja4_sni_present = "domain"
+  } else if .ja4_sni == "i" {
+    .ja4_sni_present = "ip"
+  } else {
+    .ja4_sni_present = .ja4_sni
+  }
+
+  # Decode ALPN
+  if .ja4_alpn == "00" {
+    .ja4_alpn_decoded = "none"
+  } else {
+    .ja4_alpn_decoded = .ja4_alpn
+  }
+}
+'''
+
+# Fully decode req_fp (17 underscore-separated fields) AND unique_id into
+# human-readable sub-fields using VRL.
+#
+# req_fp format (from haproxy/req_fp/src/lib.rs):
+#   {path_b62}_{method2}_{http_ver}_{path_depth}_{param_keys}_{param_types}_
+#   {param_lens}_{req_ctype}_{hdr_count}_{hdr_list}_{accept_lang}_{auth_type}_
+#   {cookie}_{cookie_fields}_{referer}_{status}_{body_bytes}
+#
+# Note: path_b62 (field 1) is NOT decoded — the `path` and `query` fields
+# already contain the human-readable request path from HAProxy's %HP/%HQ
+# log-format directives. The base62-encoded path is only used internally
+# by the fingerprint for compactness.
+#
+# unique_id format (from haproxy.py unique-id-format):
+#   %{+X}o %ci:%cp_%Ts_%rt:%pid
+#   = {client_ip_hex}:{client_port_hex}_{timestamp_hex}_{req_counter_hex}:{pid_hex}
+#   Example: 4A07F20E:8C04_6A9889FC_14FD:0012
+#   = client 74.7.242.14:35844, ts 1788420092, req_counter 5373, pid 18
+#
+# Decode mappings (from the Rust source):
+#   method2:    ge=GET, po=POST, pu=PUT, de=DELETE, pa=PATCH, he=HEAD, op=OPTIONS, co=CONNECT, tr=TRACE
+#   http_ver:   09=HTTP/0.9, 10=HTTP/1.0, 11=HTTP/1.1, 20=HTTP/2.0, 30=HTTP/3.0
+#   auth_type:  n=none, b=basic, t=bearer, d=digest, o=other
+#   cookie:     c=present, n=absent
+#   referer:    n=none, s=same-origin, x=cross-origin
+#   param_types: i=int, f=float, s=string, c=char, b=bool, t=time, d=date,
+#                z=datetime+tz, e=empty, o=object, l=list
+#                (stored as raw — see README for the mapping)
+[transforms.decode_req_fp]
+type = "remap"
+inputs = ["decode_ja4"]
+source = '''
+# --- req_fp decode ---
+if !exists(.req_fp) || .req_fp == null || .req_fp == "" {
+  .req_fp = ""
+} else if .req_fp != "err" {
+  parts = split!(.req_fp, "_")
+  if length(parts) >= 17 {
+
+    # 1. path_b62 — kept as raw keyword for fingerprint matching/comparison.
+    #    Not decoded — the `path` field from HAProxy %HP already has the
+    #    human-readable request path.
+    .req_fp_path_b62 = parts[0]
+
+    # 2. method2 -> full HTTP method name
+    .req_fp_method_raw = parts[1]
+    if .req_fp_method_raw == "ge" { .req_fp_method = "GET" }
+    else if .req_fp_method_raw == "po" { .req_fp_method = "POST" }
+    else if .req_fp_method_raw == "pu" { .req_fp_method = "PUT" }
+    else if .req_fp_method_raw == "de" { .req_fp_method = "DELETE" }
+    else if .req_fp_method_raw == "pa" { .req_fp_method = "PATCH" }
+    else if .req_fp_method_raw == "he" { .req_fp_method = "HEAD" }
+    else if .req_fp_method_raw == "op" { .req_fp_method = "OPTIONS" }
+    else if .req_fp_method_raw == "co" { .req_fp_method = "CONNECT" }
+    else if .req_fp_method_raw == "tr" { .req_fp_method = "TRACE" }
+    else { .req_fp_method = .req_fp_method_raw }
+
+    # 3. http_ver -> full HTTP version string
+    .req_fp_http_ver_raw = parts[2]
+    if .req_fp_http_ver_raw == "09" { .req_fp_http_ver = "HTTP/0.9" }
+    else if .req_fp_http_ver_raw == "10" { .req_fp_http_ver = "HTTP/1.0" }
+    else if .req_fp_http_ver_raw == "11" { .req_fp_http_ver = "HTTP/1.1" }
+    else if .req_fp_http_ver_raw == "20" { .req_fp_http_ver = "HTTP/2.0" }
+    else if .req_fp_http_ver_raw == "30" { .req_fp_http_ver = "HTTP/3.0" }
+    else { .req_fp_http_ver = .req_fp_http_ver_raw }
+
+    # 4. path_depth (integer — count of "/" in path)
+    .req_fp_path_depth = to_int(parts[3]) ?? 0
+
+    # 5-7. param_keys / param_types / param_lens
+    .req_fp_param_keys = parts[4]
+    .req_fp_param_types_raw = parts[5]
+    # param_types stored as raw — mapping: i=int f=float s=string c=char
+    # b=bool t=time d=date z=datetime+tz e=empty o=object l=list
+    .req_fp_param_lens = parts[6]
+
+    # 8. req_ctype (4-char content-type subtype, "0000" = absent)
+    .req_fp_ctype = parts[7]
+
+    # 9-10. hdr_count / hdr_list
+    .req_fp_hdr_count = to_int(parts[8]) ?? 0
+    .req_fp_hdr_list = parts[9]
+
+    # 11. accept_lang (4-char language code, "0000" = absent)
+    .req_fp_accept_lang = parts[10]
+
+    # 12. auth_type
+    .req_fp_auth_type_raw = parts[11]
+    if .req_fp_auth_type_raw == "n" { .req_fp_auth_type = "none" }
+    else if .req_fp_auth_type_raw == "b" { .req_fp_auth_type = "basic" }
+    else if .req_fp_auth_type_raw == "t" { .req_fp_auth_type = "bearer" }
+    else if .req_fp_auth_type_raw == "d" { .req_fp_auth_type = "digest" }
+    else if .req_fp_auth_type_raw == "o" { .req_fp_auth_type = "other" }
+    else { .req_fp_auth_type = .req_fp_auth_type_raw }
+
+    # 13. cookie (c=present, n=absent)
+    .req_fp_cookie_raw = parts[12]
+    if .req_fp_cookie_raw == "c" { .req_fp_cookie = "present" }
+    else if .req_fp_cookie_raw == "n" { .req_fp_cookie = "absent" }
+    else { .req_fp_cookie = .req_fp_cookie_raw }
+
+    # 14. cookie_fields (sorted first-char initials, "nil" = none)
+    .req_fp_cookie_fields = parts[13]
+
+    # 15. referer (n=none, s=same-origin, x=cross-origin)
+    .req_fp_referer_raw = parts[14]
+    if .req_fp_referer_raw == "n" { .req_fp_referer = "none" }
+    else if .req_fp_referer_raw == "s" { .req_fp_referer = "same-origin" }
+    else if .req_fp_referer_raw == "x" { .req_fp_referer = "cross-origin" }
+    else { .req_fp_referer = .req_fp_referer_raw }
+
+    # 16. status (HTTP response status code)
+    .req_fp_status = to_int(parts[15]) ?? 0
+
+    # 17. body_bytes (response body size in bytes)
+    .req_fp_body_bytes = to_int(parts[16]) ?? 0
+  }
+}
+
+# --- unique_id decode ---
+# Format: {client_ip_hex}:{client_port_hex}_{timestamp_hex}_{req_counter_hex}:{pid_hex}
+# Example: 4A07F20E:8C04_6A9889FC_14FD:0012
+#   -> client_ip 74.7.242.14, client_port 35844, timestamp 1788420092,
+#      req_counter 5373, pid 18
+if exists(.unique_id) && .unique_id != null && .unique_id != "" {
+  uid_parts = split!(.unique_id, "_")
+  if length(uid_parts) >= 3 {
+    # Part 1: client_ip:client_port (both hex)
+    ip_port = split!(uid_parts[0], ":")
+    ip_hex = to_string(ip_port[0])
+    if length(ip_hex) >= 8 {
+      .unique_id_client_ip = to_string(parse_int(slice!(ip_hex, start: 0, end: 2), 16) ?? 0) + "." + to_string(parse_int(slice!(ip_hex, start: 2, end: 4), 16) ?? 0) + "." + to_string(parse_int(slice!(ip_hex, start: 4, end: 6), 16) ?? 0) + "." + to_string(parse_int(slice!(ip_hex, start: 6, end: 8), 16) ?? 0)
+    }
+    port_hex = to_string(ip_port[1])
+    if port_hex != "" {
+      .unique_id_client_port = parse_int(port_hex, 16) ?? 0
+    }
+
+    # Part 2: timestamp (hex Unix epoch seconds)
+    ts_hex = uid_parts[1]
+    if ts_hex != "" {
+      ts_val = parse_int(ts_hex, 16) ?? 0
+      .unique_id_timestamp = ts_val
+      ts_conv = from_unix_timestamp(ts_val) ?? null
+      if ts_conv != null {
+        .unique_id_timestamp_iso = to_string(ts_conv)
+      }
+    }
+
+    # Part 3: req_counter:pid (both hex)
+    counter_pid = split!(uid_parts[2], ":")
+    counter_hex = to_string(counter_pid[0])
+    if counter_hex != "" {
+      .unique_id_request_counter = parse_int(counter_hex, 16) ?? 0
+    }
+    pid_hex = to_string(counter_pid[1])
+    if pid_hex != "" {
+      .unique_id_pid = parse_int(pid_hex, 16) ?? 0
+    }
+  }
+}
+'''
+
+# Set unique_id as the OpenSearch document ID; generate UUID if missing
+[transforms.haproxy_finalize]
+type = "remap"
+inputs = ["decode_req_fp"]
+source = '''
+if exists(.unique_id) && .unique_id != null && .unique_id != "" {
+  ._doc_id = .unique_id
+} else {
+  ._doc_id = uuid_v4()
+}
+'''
+
+# ---------------------------------------------------------------------------
+# WAF transforms: parse JSON
+# ---------------------------------------------------------------------------
+
+# Parse WAF log JSON lines (Coraza SPOA emits one JSON event per line)
+# The Coraza SPOA log format nests all useful fields under "match.*" — flatten
+# them to top-level fields so they match the waf-logs index template and are
+# available for Dashboards visualizations without dot-notation.
+[transforms.waf_parse_json]
+type = "remap"
+inputs = ["waf_file"]
+source = '''
+parsed, err = parse_json(.message)
+if err == null {
+  . = merge!(., parsed)
+}
+
+# Flatten match.* fields to top-level
+if exists(.match) {
+  m = .match
+  .rule_id = to_string(m.rule_id) ?? ""
+  .severity = to_string(m.severity) ?? ""
+  .msg = to_string(m.msg) ?? ""
+  .client_ip = m.client
+  .uri = to_string(m.uri) ?? ""
+  .unique_id = to_string(m.unique_id) ?? ""
+  .action = if m.disruptive == true { "blocked" } else { "allowed" }
+  .tags = m.tags
+  # Keep the nested match object for full detail in Discover
+}
+
+# Normalize high-cardinality WAF messages that only differ by a numeric score
+# so the dashboard can group them. The full original message remains in match.msg.
+if is_string(.msg) {
+  .msg = replace(.msg, r'^Inbound Anomaly Score Exceeded \(Total Score: [0-9]+\)$', "Inbound Anomaly Score Exceeded")
+}
+
+# Common timestamp field for cross-index correlation (combined index pattern).
+# Coraza SPOA emits the event time as either "time" or "timestamp" at the top
+# level (different versions / log formats). Prefer "time", fall back to
+# "timestamp", and finally use the Vector ingestion time as a last resort.
+ts_str = to_string(.time) ?? ""
+if ts_str == "" {
+  ts_str = to_string(.timestamp) ?? ""
+}
+if ts_str != "" {
+  .@timestamp = ts_str
+} else {
+  .@timestamp = now()
+}
+# Drop the redundant raw source time fields; @timestamp is the canonical one.
+del(.time)
+del(.timestamp)
+
+._doc_id = uuid_v4()
+'''
+
+# ---------------------------------------------------------------------------
+# Sinks — Vector uses the "elasticsearch" sink type for OpenSearch
+# (OpenSearch is Elasticsearch API compatible). The "bulk.index" field supports
+# strftime templates for daily index routing. "id_key" maps an event field
+# to OpenSearch's _id.
+# ---------------------------------------------------------------------------
+
+# HAProxy logs -> OpenSearch corex-log-* index
+[sinks.opensearch_haproxy]
+type = "elasticsearch"
+inputs = ["haproxy_finalize"]
+endpoints = ["https://opensearch:9200"]
+opensearch_service_type = "managed"
+suppress_type_name = true
+auth.strategy = "basic"
+auth.user = "admin"
+auth.password = "${OPENSEARCH_ADMIN_PASSWORD}"
+bulk.index = "corex-log-%Y.%m.%d"
+id_key = "_doc_id"
+tls.verify_certificate = false
+tls.verify_hostname = false
+encoding.except_fields = ["_doc_id", "_syslog_facility", "_syslog_severity", "_syslog_hostname"]
+
+# WAF logs -> OpenSearch waf-logs-* index
+[sinks.opensearch_waf]
+type = "elasticsearch"
+inputs = ["waf_parse_json"]
+endpoints = ["https://opensearch:9200"]
+opensearch_service_type = "managed"
+suppress_type_name = true
+auth.strategy = "basic"
+auth.user = "admin"
+auth.password = "${OPENSEARCH_ADMIN_PASSWORD}"
+bulk.index = "waf-logs-%Y.%m.%d"
+id_key = "_doc_id"
+tls.verify_certificate = false
+tls.verify_hostname = false
+encoding.except_fields = ["_doc_id"]

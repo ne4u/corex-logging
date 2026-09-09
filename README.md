@@ -1,0 +1,424 @@
+# coreX Logging Pipeline
+
+HAProxy + WAF logs to OpenSearch via [Vector](https://vector.dev), using Docker Compose.
+
+This is a standalone project that runs alongside the [coreX Manager](https://github.com/akauffman/corex_manager) stack. It collects HAProxy request logs via UDP syslog and WAF (Coraza SPOA) logs via file tailing, decodes JA4 TLS fingerprints, request fingerprints (req_fp), and unique request IDs into structured sub-fields, and ships them to two separate OpenSearch indices.
+
+## Architecture
+
+```
+corex_manager stack                          corex-logging stack
+┌──────────┐   UDP syslog:514   ┌─────────┐   ┌────────────┐
+│ HAProxy  │ ─────────────────> │ Vector  │ ─>│ OpenSearch │
+│ (corex)  │   log vector   │         │   │ haproxy-*  │
+└──────────┘                    │         │   ├────────────┤
+┌──────────┐  /app/data/        │         │ ─>│ waf-logs-* │
+│ Coraza   │  coraza-spoa.log   │         │   └────────────┘
+│ SPOA     │ ──> [haproxy-data] │         │        │
+└──────────┘                    └─────────┘   ┌────────────┐
+                                              │ Dashboards │
+                                              │ :5601      │
+                                              └────────────┘
+```
+
+| Log type | Source | Transport | OpenSearch Index |
+|----------|--------|-----------|------------------|
+| HAProxy request logs | HAProxy `log` directive | UDP syslog (`vector:514`) | `corex-log-YYYY.MM.DD` |
+| WAF (Coraza SPOA) logs | `/app/data/coraza-spoa.log` file | File tailing (Vector file source) | `waf-logs-YYYY.MM.DD` |
+
+### Why UDP syslog?
+
+HAProxy's JSON log-format includes JA4, req_fp, WAF fields, and CSP report bodies. These lines can exceed 65535 bytes. UDP syslog truncates at ~2048 bytes. TCP has no size limit. HAProxy 3.4 supports the `tcp+` prefix in log targets.
+
+### Why file tailing for WAF logs?
+
+Coraza SPOA only supports file-based logging (not syslog). The log file lives on the shared `haproxy-data` volume. The coreX Manager WAF sampler prunes this file in-place (using `ftruncate`, not `os.replace`) so the inode is preserved and Vector can tail it reliably across prune cycles.
+
+## Prerequisites
+
+1. **coreX Manager stack running** via `docker compose up -d` in the `corex_manager/` directory
+2. **Docker Compose** (v2+)
+3. **WAF log pruning fix applied** — the `prune_waf_log_file` function in `backend/app/services/waf_metrics.py` must use in-place truncation (`ftruncate`) instead of `os.replace`. This is included in recent versions of coreX Manager. If you're on an older version, apply the fix and restart the `api` service:
+   ```bash
+   cd corex_manager
+   docker compose restart api
+   ```
+
+## Setup
+
+### 1. Configure environment
+
+```bash
+cd corex-logging
+cp .env.example .env
+# Edit .env — set OPENSEARCH_ADMIN_PASSWORD
+#   Must be 16+ chars with uppercase, lowercase, digit, and special char.
+#   Avoid '#' in the password (Docker Compose .env parsing may truncate at '#').
+```
+
+By default, OpenSearch data is stored in a Docker named volume (`opensearch-data`). To use a host directory instead (e.g. NFS/network storage), uncomment and set `OPENSEARCH_DATA_DIR` in `.env`:
+
+```env
+OPENSEARCH_DATA_DIR=/mnt/nsf-volume/opensearch
+```
+
+The directory must exist and be writable by the OpenSearch container (UID 1000). Create it before starting the stack:
+
+```bash
+mkdir -p /mnt/nsf-volume/opensearch
+chown 1000:1000 /mnt/nsf-volume/opensearch
+```
+
+**HAProxy data directory** — Vector reads WAF logs from the same directory that HAProxy writes to. This must match the path used by your coreX Manager stack. The coreX Manager `docker-compose.yml` mounts `${DATA_DIR}/haproxy` as `/app/data` for HAProxy and Coraza. Set `HAPROXY_DATA_DIR` in `.env` to that same host path:
+
+```env
+# If corex_manager uses DATA_DIR=/mnt/nsf-volume, then:
+HAPROXY_DATA_DIR=/mnt/nsf-volume/haproxy
+```
+
+If `HAPROXY_DATA_DIR` is not set, it defaults to `./data/haproxy` relative to this project (which works when both stacks run from the same host directory).
+
+If your coreX Manager deployment uses a non-default Docker Compose project name (e.g. you set `COMPOSE_PROJECT_NAME` or deployed to a different directory), update `COREX_NETWORK_NAME` in `.env` to match:
+
+```env
+COREX_NETWORK_NAME=corex_manager_corex-net
+```
+
+You can verify the network name with:
+```bash
+docker network ls | grep corex-net
+```
+
+### 2. Start the logging stack
+
+```bash
+docker compose up -d
+```
+
+This starts three services:
+- **opensearch** — single-node OpenSearch with security plugin (demo certs), port 9200
+- **opensearch-dashboards** — OpenSearch Dashboards UI, port 5601
+- **vector** — log collector, joins both `logging-net` and `corex-net`
+
+Wait for OpenSearch to become healthy:
+```bash
+docker compose logs -f opensearch
+# Wait for "Active license is now ..." / cluster health yellow/green
+```
+
+### 3. Create index templates, Dashboards patterns, and dashboards
+
+```bash
+OPENSEARCH_ADMIN_PASSWORD=YourPassword ./scripts/setup-opensearch.sh
+```
+
+This creates:
+- OpenSearch index templates for `corex-log-*` and `waf-logs-*` with explicit field mappings (JA4 sub-fields, req_fp sub-fields, IP types, etc.)
+- Dashboards index patterns so the Discover UI can browse both indices
+- Saved searches: "4xx/5xx Errors", "Slow Requests (>1s)", "WAF Blocked Requests", "Security Rule Hits"
+- Visualizations: requests over time, status code distribution, top client IPs, top ASN organizations, top request paths, avg response time, WAF events over time, WAF events by message, WAF actions, top WAF client IPs
+- Dashboards: "CoreX HAProxy Overview" (6 panels) and "CoreX WAF Overview" (4 panels)
+
+### 4. Create HAProxy LogDestination
+
+Create a LogDestination in coreX Manager so HAProxy sends logs to Vector via UDP syslog.
+
+#### Via the coreX Manager UI
+
+1. Open the coreX Manager UI in your browser and log in as admin
+2. Navigate to **Observability → Logging** in the left sidebar
+3. Under **Log Destinations**, click **Add Destination**
+4. Fill in the form:
+   - **Name**: `opensearch-vector`
+   - **Listener**: leave as "All" (applies to all listeners)
+   - **Target**: `vector:514`
+   - **Facility**: `local0`
+   - **Level**: `info`
+   - **Enabled**: checked
+5. Click **Save**
+
+#### Via the coreX Manager API
+
+```bash
+# Authenticate
+TOKEN=$(curl -s -X POST http://localhost:8000/api/v1/auth/token \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  -d 'username=admin&password=YourCorexAdminPassword' \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+
+# Create the LogDestination
+curl -s -X POST http://localhost:8000/api/v1/log-destinations \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "opensearch-vector",
+    "target": "tcp+vector:601",
+    "facility": "local0",
+    "level": "info",
+    "enabled": true
+  }' | python3 -m json.tool
+```
+
+The target `vector:514` tells HAProxy to send logs via UDP syslog to the Vector container on port 601. The `vector` hostname resolves via the shared Docker network (`corex-net`).
+
+### 5. Apply config in coreX Manager
+
+The LogDestination is added to the database but HAProxy's config is only regenerated when you apply. Either:
+- Click "Apply" in the coreX Manager UI, OR
+- It auto-applies if no other pending config changes exist (the feed auto-apply logic handles this)
+
+After applying, HAProxy will start sending UDP syslog to Vector. Verify:
+```bash
+docker compose -f corex-logging/docker-compose.yml logs -f vector
+# You should see incoming syslog events being parsed and shipped
+```
+
+### 6. Verify data in OpenSearch
+
+```bash
+# Check HAProxy log count
+curl -sku admin:$OPENSEARCH_ADMIN_PASSWORD https://localhost:9200/corex-log-*/_count
+
+# Check a sample document — verify JA4 and req_fp sub-fields are decoded
+curl -sku admin:$OPENSEARCH_ADMIN_PASSWORD https://localhost:9200/corex-log-*/_search?size=1 | python3 -m json.tool
+
+# Check WAF log count (generate WAF traffic first by triggering a Coraza rule)
+curl -sku admin:$OPENSEARCH_ADMIN_PASSWORD https://localhost:9200/waf-logs-*/_count
+```
+
+### 7. Open OpenSearch Dashboards
+
+Navigate to `http://localhost:5601` and log in with `admin` / your `OPENSEARCH_ADMIN_PASSWORD`.
+
+Go to **Discover** and select the `corex-log-*` or `waf-logs-*` index pattern to browse logs. The decoded JA4 sub-fields (`ja4_proto`, `ja4_version`, `ja4_sni`, etc.) and req_fp sub-fields (`req_fp_method`, `req_fp_path_depth`, `req_fp_hdr_count`, etc.) are available as searchable columns.
+
+## Decoded Fields
+
+### JA4 (TLS fingerprint)
+
+The `ja4` field is fully decoded into human-readable sub-fields:
+
+| Field | Description | Example |
+|-------|-------------|---------|
+| `ja4_proto` | Raw protocol code | `t` |
+| `ja4_protocol` | Decoded protocol name | `TLS` |
+| `ja4_version` | Raw version code | `13` |
+| `ja4_tls_version` | Decoded TLS version | `TLSv1.3` |
+| `ja4_sni` | Raw SNI code | `d` |
+| `ja4_sni_present` | Decoded SNI status | `domain` |
+| `ja4_cipher_count` | Number of cipher suites (integer) | `15` |
+| `ja4_ext_count` | Number of extensions (integer) | `16` |
+| `ja4_alpn` | Raw ALPN code | `h2` |
+| `ja4_alpn_decoded` | Decoded ALPN | `h2` or `none` |
+| `ja4_cipher_hash` | Truncated SHA-256 of cipher list | `8daaf6152771` |
+| `ja4_ext_hash` | Truncated SHA-256 of extensions+sigalgs | `b186095e22b6` |
+| `ja4_a` | Full JA4_a prefix (10 chars) | `t13d1516h2` |
+| `ja4_b` | Cipher hash | `8daaf6152771` |
+| `ja4_c` | Extension hash | `b186095e22b6` |
+
+Protocol decode map: `t`→TLS, `d`→DTLS, `q`→QUIC
+
+Version decode map: `13`→TLSv1.3, `12`→TLSv1.2, `11`→TLSv1.1, `10`→TLSv1.0, `s3`→SSLv3, `s2`→SSLv2, `d1`→DTLSv1.0, `d2`→DTLSv1.2, `d3`→DTLSv1.3
+
+SNI decode map: `d`→domain (SNI present), `i`→ip (no SNI)
+
+### req_fp (HTTP request fingerprint)
+
+The `req_fp` field (17 underscore-separated fields) is decoded into human-readable sub-fields. The base62-encoded path (field 1) is kept as a raw keyword for fingerprint matching — the `path` and `query` fields from HAProxy's `%HP`/`%HQ` log directives already provide the human-readable request path. All other encoded field codes are mapped to human-readable values.
+
+| Field | Description | Example |
+|-------|-------------|---------|
+| `req_fp_path_b62` | Raw base62-encoded path (for fingerprint matching) | `1fT` |
+| `req_fp_method_raw` | Raw 2-char method code | `ge` |
+| `req_fp_method` | Decoded HTTP method | `GET` |
+| `req_fp_http_ver_raw` | Raw version code | `11` |
+| `req_fp_http_ver` | Decoded HTTP version | `HTTP/1.1` |
+| `req_fp_path_depth` | Path depth (count of `/`) | `3` |
+| `req_fp_param_keys` | First chars of parameter names | `ns` |
+| `req_fp_param_types_raw` | Raw parameter type codes | `is` |
+| `req_fp_param_lens` | Parameter value lengths (dash-separated) | `5-10` |
+| `req_fp_ctype` | Raw Content-Type subtype (4 chars) | `json` |
+| `req_fp_hdr_count` | Header count (integer) | `12` |
+| `req_fp_hdr_list` | Sorted header name initials | `acch` |
+| `req_fp_accept_lang` | Raw Accept-Language (4 chars) | `enus` |
+| `req_fp_auth_type_raw` | Raw auth type code | `b` |
+| `req_fp_auth_type` | Decoded auth type | `basic` |
+| `req_fp_cookie_raw` | Raw cookie code | `c` |
+| `req_fp_cookie` | Decoded cookie status | `present` |
+| `req_fp_cookie_fields` | Cookie field name initials | `stu` |
+| `req_fp_referer_raw` | Raw referer code | `s` |
+| `req_fp_referer` | Decoded referer status | `same-origin` |
+| `req_fp_status` | HTTP response status (integer) | `200` |
+| `req_fp_body_bytes` | Response body bytes (long) | `1024` |
+
+Method decode map: `ge`→GET, `po`→POST, `pu`→PUT, `de`→DELETE, `pa`→PATCH, `he`→HEAD, `op`→OPTIONS, `co`→CONNECT, `tr`→TRACE
+
+HTTP version decode map: `09`→HTTP/0.9, `10`→HTTP/1.0, `11`→HTTP/1.1, `20`→HTTP/2.0, `30`→HTTP/3.0
+
+Auth type decode map: `n`→none, `b`→basic, `t`→bearer, `d`→digest, `o`→other
+
+Cookie decode map: `c`→present, `n`→absent
+
+Referer decode map: `n`→none, `s`→same-origin, `x`→cross-origin
+
+Param type decode map (raw field, not auto-decoded): `i`→int, `f`→float, `s`→string, `c`→char, `b`→bool, `t`→time, `d`→date, `z`→datetime+tz, `e`→empty, `o`→object, `l`→list
+
+### unique_id (HAProxy request identifier)
+
+The `unique_id` field is HAProxy's `%ID` — a hex-encoded composite identifier. It's used as the OpenSearch document `_id` for deduplication, and also decoded into structured sub-fields.
+
+Format: `%{+X}o %ci:%cp_%Ts_%rt:%pid` (3 underscore-separated parts, all hex)
+
+Example: `4A07F20E:8C04_6A9889FC_14FD:0012`
+
+| Field | Description | Example |
+|-------|-------------|---------|
+| `unique_id` | Raw HAProxy unique ID | `4A07F20E:8C04_6A9889FC_14FD:0012` |
+| `unique_id_client_ip` | Client IP decoded from hex | `74.7.242.14` |
+| `unique_id_client_port` | Client port decoded from hex | `35844` |
+| `unique_id_timestamp` | Unix timestamp (epoch seconds) decoded from hex | `1788420092` |
+| `unique_id_timestamp_iso` | ISO 8601 timestamp (UTC) | `2026-08-31T12:41:32Z` |
+| `unique_id_request_counter` | HAProxy request counter decoded from hex | `5373` |
+| `unique_id_pid` | HAProxy process ID decoded from hex | `18` |
+
+If `unique_id` is missing, a UUID v4 is generated for the document `_id` and the decoded sub-fields are not set.
+
+### ASN enrichment (GeoLite2-ASN)
+
+HAProxy enriches each log entry with ASN data from the MaxMind GeoLite2-ASN database via the Rust `geoip2` Lua module. The following fields are emitted directly in the JSON log-format — no Vector-side enrichment needed:
+
+| Field | Description | Example |
+|-------|-------------|---------|
+| `asn` | Autonomous system number with `AS` prefix | `AS7922` |
+| `asn_org` | Autonomous system organization name | `Comcast Cable Communications, LLC` |
+| `asn_network` | Network CIDR block containing the client IP | `73.0.0.0/8` |
+
+These fields are populated when the Rust geoip2 module is available and the GeoLite2-ASN database is loaded. If the lookup fails (e.g., IP not in database), the fields are empty strings.
+
+### Captured HTTP headers
+
+In addition to the core request fields, HAProxy emits the following HTTP headers as top-level fields in the JSON log line:
+
+| Field | Description | Example |
+|-------|-------------|---------|
+| `xff` | Full `X-Forwarded-For` header chain as received from the client/upstream proxy | `203.0.113.195, 198.51.100.42` |
+| `referer` | `Referer` HTTP header (the full URL/URI the request came from, when present) | `https://example.com/page` |
+
+## Services
+
+| Service | Port | Description |
+|---------|------|-------------|
+| OpenSearch | 9200 | Search engine API (HTTPS) |
+| OpenSearch Dashboards | 5601 | Web UI for querying and visualizing logs |
+| Vector | (internal) | Log collector — listens on UDP 514 for syslog, tails WAF log file |
+
+## Log Correlation
+
+Both HAProxy logs and WAF (Coraza SPOA) logs share the same `unique_id` field — HAProxy passes its `%ID` to the Coraza SPOA via the `id=unique-id` SPOE argument, and Coraza includes it in its log output. This allows correlating a request's HAProxy log entry with all WAF rule hits for that request.
+
+### Combined Saved Search (auto-created)
+
+The setup script creates a combined index pattern `corex-log-*,waf-logs-*` with `@timestamp` as the common time field, plus a saved search "Request Correlation (HAProxy + WAF)". To use it:
+
+1. Open Dashboards → Discover
+2. Open the saved search "Request Correlation (HAProxy + WAF)"
+3. Add a filter: `unique_id` = the request ID you want to investigate (e.g. `4A07F20E:8C04_6A9889FC_14FD:0012`)
+4. You'll see the HAProxy log entry and all WAF events for that request, sorted by `@timestamp`
+
+The `@timestamp` field is added by Vector to both log types (parsed from `ts` for HAProxy logs and from the WAF log's `time` or `timestamp` field for WAF logs; the redundant source time fields are dropped) so the combined index pattern has a working time picker.
+
+The saved search defaults to these columns: `@timestamp`, `unique_id`, `client`, `client_ip`, `method`, `path`, `status`, `action`, `rule_id`, `msg`, `severity`, `uri`. Columns only contain values for the row's source index (e.g. `msg` is only set on `waf-logs-*` rows, `method`/`path`/`status` only on `corex-log-*` rows).
+
+If WAF fields like `msg` or `rule_id` are not visible, the combined index pattern's field cache was likely populated before WAF data was ingested. Re-run `scripts/setup-dashboards.py` after both indices have documents, or go to **Stack Management → Index Patterns → `corex-log-*,waf-logs-*`** and click the refresh icon to update the field list.
+
+### OpenSearch Transform (optional, for advanced analysis)
+
+For a more structured correlation, you can use OpenSearch's [Transform](https://docs.opensearch.org/latest/data-prepper/transform/) feature to continuously join WAF events with HAProxy logs on `unique_id` into a new `corex-corlated-*` index. Each document in the correlated index would contain the full HAProxy request context (method, path, status, ASN, JA4) plus an array of WAF rule hits.
+
+To set this up manually:
+
+1. Create a transform that pivots WAF events by `unique_id` and joins with `corex-log-*`:
+
+```bash
+curl -ku admin:$OPENSEARCH_ADMIN_PASSWORD -X PUT \
+  "https://localhost:9200/_plugins/_transform/corex-correlated" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "transform": {
+      "enabled": true,
+      "continuous": true,
+      "source_index": ["waf-logs-*"],
+      "pivot": {
+        "group_by": {
+          "unique_id": { "terms": { "field": "unique_id" } }
+        },
+        "aggregations": {
+          "waf_rule_ids": { "terms": { "field": "rule_id" } },
+          "waf_actions": { "terms": { "field": "action" } },
+          "waf_event_count": { "value_count": { "field": "rule_id" } },
+          "waf_messages": { "top_hits": { "size": 10, "sort": [{ "@timestamp": "asc" }], "_source": ["msg", "severity", "uri", "client_ip"] } }
+        }
+      },
+      "target_index": "corex-correlated",
+      "schedule": { "interval": { "period": 1, "unit": "minutes" } }
+    }
+  }'
+```
+
+2. Create an index template for the correlated index with the HAProxy fields you want to join:
+
+```bash
+curl -ku admin:$OPENSEARCH_ADMIN_PASSWORD -X PUT \
+  "https://localhost:9200/_index_template/corex-correlated" \
+  -H 'Content-Type: application/json' \
+  -d @scripts/index-templates/corex-log.json
+```
+
+3. Use an [enrichment pipeline](https://docs.opensearch.org/latest/ingest-pipelines/processors/enrich/) to enrich the correlated documents with HAProxy fields (method, path, status, ASN, JA4) by looking up `unique_id` in `corex-log-*`.
+
+4. Create a Dashboards index pattern for `corex-correlated` to visualize WAF rule hits with full request context.
+
+## Troubleshooting
+
+### Vector not receiving HAProxy logs
+
+1. Verify the LogDestination was created: `curl -s http://localhost:8000/api/v1/log-destinations -H "Authorization: Bearer <token>" | python3 -m json.tool`
+2. Verify HAProxy config was applied (check the coreX UI for pending changes)
+3. Check Vector can resolve `vector` hostname from the corex container: `docker exec corex getent hosts vector`
+4. Check Vector is listening on port 601: `docker exec -it <vector-container> netstat -ulnp | grep 514`
+
+### Vector not receiving WAF logs
+
+1. Verify the `haproxy-data` volume is mounted read-only in Vector: `docker exec <vector-container> ls -la /app/data/coraza-spoa.log`
+2. Verify the WAF log file exists: it may not exist if no WAF events have been logged yet
+3. Check Vector file source logs: `docker compose logs vector | grep waf_file`
+
+### OpenSearch health check fails
+
+1. Check OpenSearch logs: `docker compose logs opensearch`
+2. Ensure `OPENSEARCH_ADMIN_PASSWORD` is at least 16 characters
+3. Ensure Docker has at least 4GB of memory allocated (OpenSearch + Dashboards)
+
+### Demo certificates warning
+
+This setup uses OpenSearch's bundled demo certificates (`esnode.pem`, `root-ca.pem`). These are for development/internal use only. For production, replace with custom TLS certificates by mounting your certs and updating `opensearch/opensearch.yml`.
+
+## Files
+
+```
+corex-logging/
+├── docker-compose.yml          # OpenSearch + Dashboards + Vector services
+├── .env.example                # Config template (passwords, network/volume names)
+├── README.md                   # This file
+├── vector/
+│   └── vector.toml             # Vector config: sources, VRL transforms, sinks
+├── opensearch/
+│   └── opensearch.yml          # OpenSearch single-node config with demo certs
+└── scripts/
+    ├── setup-opensearch.sh     # Create index templates + Dashboards patterns + dashboards
+    ├── setup-dashboards.py     # Create saved searches, visualizations, and dashboards
+    ├── create-logdestination.sh # (optional) Script to create LogDestination via coreX API
+    └── index-templates/
+        ├── corex-log.json   # OpenSearch index template for HAProxy logs
+        └── waf-logs.json       # OpenSearch index template for WAF logs
+```

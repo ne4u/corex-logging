@@ -1,0 +1,14 @@
+---
+opensearch.hosts: [https://localhost:9200]
+opensearch.ssl.verificationMode: none
+opensearch.username: kibanaserver
+opensearch.password: kibanaserver
+opensearch.requestHeadersWhitelist: [authorization, securitytenant, X-Forwarded-For]
+
+# Disable multitenancy so all saved objects go to the default namespace.
+# This avoids the split-brain issue where API-created objects (using the
+# global tenant) are invisible to the browser (which defaults to Private).
+opensearch_security.multitenancy.enabled: false
+opensearch_security.readonly_mode.roles: [kibana_read_only]
+opensearch_security.cookie.secure: false
+server.host: '0.0.0.0'
