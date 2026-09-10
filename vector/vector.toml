@@ -412,7 +412,7 @@ if exists(.match) {
 # Normalize high-cardinality WAF messages that only differ by a numeric score
 # so the dashboard can group them. The full original message remains in match.msg.
 if is_string(.msg) {
-  .msg = replace(.msg, r'^Inbound Anomaly Score Exceeded \(Total Score: [0-9]+\)$', "Inbound Anomaly Score Exceeded")
+  .msg = replace!(.msg, r'^Inbound Anomaly Score Exceeded \(Total Score: [0-9]+\)$', "Inbound Anomaly Score Exceeded")
 }
 
 # Common timestamp field for cross-index correlation (combined index pattern).
