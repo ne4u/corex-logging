@@ -1,48 +1,39 @@
 # coreX Logging Pipeline
 
-HAProxy + WAF logs to OpenSearch via [Vector](https://vector.dev), using Docker Compose.
+OpenSearch + OpenSearch Dashboards for HAProxy + WAF logs, using Docker Compose.
 
-This is a standalone project that runs alongside the [coreX Manager](https://github.com/akauffman/corex_manager) stack. It collects HAProxy request logs via UDP syslog and WAF (Coraza SPOA) logs via file tailing, decodes JA4 TLS fingerprints, request fingerprints (req_fp), and unique request IDs into structured sub-fields, and ships them to two separate OpenSearch indices.
+This is a standalone project that runs alongside the [coreX Manager](https://github.com/akauffman/corex_manager) stack. It provides the OpenSearch storage and Dashboards UI for HAProxy request logs and WAF (Coraza SPOA) logs.
+
+> **Note:** The [Vector](https://vector.dev) log collector that ships logs from HAProxy/Coraza into OpenSearch is now part of coreX Manager. This repo no longer runs a Vector service — it only provides OpenSearch and OpenSearch Dashboards. See the coreX Manager stack for Vector configuration, sources, VRL transforms, and HAProxy LogDestination setup.
 
 ## Architecture
 
 ```
 corex_manager stack                          corex-logging stack
-┌──────────┐   UDP syslog:514   ┌─────────┐   ┌────────────┐
-│ HAProxy  │ ─────────────────> │ Vector  │ ─>│ OpenSearch │
-│ (corex)  │   log vector   │         │   │ haproxy-*  │
-└──────────┘                    │         │   ├────────────┤
-┌──────────┐  /app/data/        │         │ ─>│ waf-logs-* │
-│ Coraza   │  coraza-spoa.log   │         │   └────────────┘
-│ SPOA     │ ──> [haproxy-data] │         │        │
-└──────────┘                    └─────────┘   ┌────────────┐
-                                              │ Dashboards │
-                                              │ :5601      │
-                                              └────────────┘
+┌──────────┐   ┌─────────┐                ┌────────────┐
+│ HAProxy  │   │ Vector  │ ─────────────> │ OpenSearch │
+│ (corex)  │   │ (corex) │                │ haproxy-*  │
+└──────────┘   └─────────┘                ├────────────┤
+┌──────────┐      │                       │ waf-logs-* │
+│ Coraza   │ ─────┘                       └────────────┤
+│ SPOA     │                                  │
+└──────────┘                               ┌────────────┐
+                                           │ Dashboards │
+                                           │ :5601      │
+                                           └────────────┘
 ```
 
-| Log type | Source | Transport | OpenSearch Index |
-|----------|--------|-----------|------------------|
-| HAProxy request logs | HAProxy `log` directive | UDP syslog (`vector:514`) | `corex-log-YYYY.MM.DD` |
-| WAF (Coraza SPOA) logs | `/app/data/coraza-spoa.log` file | File tailing (Vector file source) | `waf-logs-YYYY.MM.DD` |
+| Log type | Source | OpenSearch Index |
+|----------|--------|------------------|
+| HAProxy request logs | HAProxy `log` directive (syslog, collected by Vector in coreX Manager) | `corex-log-YYYY.MM.DD` |
+| WAF (Coraza SPOA) logs | `/app/data/coraza-spoa.log` file (tailed by Vector in coreX Manager) | `waf-logs-YYYY.MM.DD` |
 
-### Why UDP syslog?
-
-HAProxy's JSON log-format includes JA4, req_fp, WAF fields, and CSP report bodies. These lines can exceed 65535 bytes. UDP syslog truncates at ~2048 bytes. TCP has no size limit. HAProxy 3.4 supports the `tcp+` prefix in log targets.
-
-### Why file tailing for WAF logs?
-
-Coraza SPOA only supports file-based logging (not syslog). The log file lives on the shared `haproxy-data` volume. The coreX Manager WAF sampler prunes this file in-place (using `ftruncate`, not `os.replace`) so the inode is preserved and Vector can tail it reliably across prune cycles.
+Vector (in coreX Manager) collects HAProxy request logs via syslog and WAF (Coraza SPOA) logs via file tailing, decodes JA4 TLS fingerprints, request fingerprints (req_fp), and unique request IDs into structured sub-fields, and ships them to two separate OpenSearch indices in this stack.
 
 ## Prerequisites
 
-1. **coreX Manager stack running** via `docker compose up -d` in the `corex_manager/` directory
+1. **coreX Manager stack running** via `docker compose up -d` in the `corex_manager/` directory (this includes the Vector log collector)
 2. **Docker Compose** (v2+)
-3. **WAF log pruning fix applied** — the `prune_waf_log_file` function in `backend/app/services/waf_metrics.py` must use in-place truncation (`ftruncate`) instead of `os.replace`. This is included in recent versions of coreX Manager. If you're on an older version, apply the fix and restart the `api` service:
-   ```bash
-   cd corex_manager
-   docker compose restart api
-   ```
 
 ## Setup
 
@@ -69,36 +60,15 @@ mkdir -p /mnt/nsf-volume/opensearch
 chown 1000:1000 /mnt/nsf-volume/opensearch
 ```
 
-**HAProxy data directory** — Vector reads WAF logs from the same directory that HAProxy writes to. This must match the path used by your coreX Manager stack. The coreX Manager `docker-compose.yml` mounts `${DATA_DIR}/haproxy` as `/app/data` for HAProxy and Coraza. Set `HAPROXY_DATA_DIR` in `.env` to that same host path:
-
-```env
-# If corex_manager uses DATA_DIR=/mnt/nsf-volume, then:
-HAPROXY_DATA_DIR=/mnt/nsf-volume/haproxy
-```
-
-If `HAPROXY_DATA_DIR` is not set, it defaults to `./data/haproxy` relative to this project (which works when both stacks run from the same host directory).
-
-If your coreX Manager deployment uses a non-default Docker Compose project name (e.g. you set `COMPOSE_PROJECT_NAME` or deployed to a different directory), update `COREX_NETWORK_NAME` in `.env` to match:
-
-```env
-COREX_NETWORK_NAME=corex_manager_corex-net
-```
-
-You can verify the network name with:
-```bash
-docker network ls | grep corex-net
-```
-
 ### 2. Start the logging stack
 
 ```bash
 docker compose up -d
 ```
 
-This starts three services:
+This starts two services:
 - **opensearch** — single-node OpenSearch with security plugin (demo certs), port 9200
 - **opensearch-dashboards** — OpenSearch Dashboards UI, port 5601
-- **vector** — log collector, joins both `logging-net` and `corex-net`
 
 Wait for OpenSearch to become healthy:
 ```bash
@@ -119,61 +89,9 @@ This creates:
 - Visualizations: requests over time, status code distribution, top client IPs, top ASN organizations, top request paths, avg response time, WAF events over time, WAF events by message, WAF actions, top WAF client IPs
 - Dashboards: "CoreX HAProxy Overview" (6 panels) and "CoreX WAF Overview" (4 panels)
 
-### 4. Create HAProxy LogDestination
+### 4. Verify data in OpenSearch
 
-Create a LogDestination in coreX Manager so HAProxy sends logs to Vector via UDP syslog.
-
-#### Via the coreX Manager UI
-
-1. Open the coreX Manager UI in your browser and log in as admin
-2. Navigate to **Observability → Logging** in the left sidebar
-3. Under **Log Destinations**, click **Add Destination**
-4. Fill in the form:
-   - **Name**: `opensearch-vector`
-   - **Listener**: leave as "All" (applies to all listeners)
-   - **Target**: `vector:514`
-   - **Facility**: `local0`
-   - **Level**: `info`
-   - **Enabled**: checked
-5. Click **Save**
-
-#### Via the coreX Manager API
-
-```bash
-# Authenticate
-TOKEN=$(curl -s -X POST http://localhost:8000/api/v1/auth/token \
-  -H 'Content-Type: application/x-www-form-urlencoded' \
-  -d 'username=admin&password=YourCorexAdminPassword' \
-  | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
-
-# Create the LogDestination
-curl -s -X POST http://localhost:8000/api/v1/log-destinations \
-  -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "name": "opensearch-vector",
-    "target": "tcp+vector:601",
-    "facility": "local0",
-    "level": "info",
-    "enabled": true
-  }' | python3 -m json.tool
-```
-
-The target `vector:514` tells HAProxy to send logs via UDP syslog to the Vector container on port 601. The `vector` hostname resolves via the shared Docker network (`corex-net`).
-
-### 5. Apply config in coreX Manager
-
-The LogDestination is added to the database but HAProxy's config is only regenerated when you apply. Either:
-- Click "Apply" in the coreX Manager UI, OR
-- It auto-applies if no other pending config changes exist (the feed auto-apply logic handles this)
-
-After applying, HAProxy will start sending UDP syslog to Vector. Verify:
-```bash
-docker compose -f corex-logging/docker-compose.yml logs -f vector
-# You should see incoming syslog events being parsed and shipped
-```
-
-### 6. Verify data in OpenSearch
+Once Vector (in coreX Manager) is configured to ship logs to this OpenSearch instance:
 
 ```bash
 # Check HAProxy log count
@@ -186,13 +104,15 @@ curl -sku admin:$OPENSEARCH_ADMIN_PASSWORD https://localhost:9200/corex-log-*/_s
 curl -sku admin:$OPENSEARCH_ADMIN_PASSWORD https://localhost:9200/waf-logs-*/_count
 ```
 
-### 7. Open OpenSearch Dashboards
+### 5. Open OpenSearch Dashboards
 
 Navigate to `http://localhost:5601` and log in with `admin` / your `OPENSEARCH_ADMIN_PASSWORD`.
 
 Go to **Discover** and select the `corex-log-*` or `waf-logs-*` index pattern to browse logs. The decoded JA4 sub-fields (`ja4_proto`, `ja4_version`, `ja4_sni`, etc.) and req_fp sub-fields (`req_fp_method`, `req_fp_path_depth`, `req_fp_hdr_count`, etc.) are available as searchable columns.
 
 ## Decoded Fields
+
+The fields below are decoded by Vector (now in coreX Manager) before logs are shipped to OpenSearch. They are documented here so you know what's available to query and visualize in Dashboards.
 
 ### JA4 (TLS fingerprint)
 
@@ -310,7 +230,6 @@ In addition to the core request fields, HAProxy emits the following HTTP headers
 |---------|------|-------------|
 | OpenSearch | 9200 | Search engine API (HTTPS) |
 | OpenSearch Dashboards | 5601 | Web UI for querying and visualizing logs |
-| Vector | (internal) | Log collector — listens on UDP 514 for syslog, tails WAF log file |
 
 ## Log Correlation
 
@@ -374,24 +293,19 @@ curl -ku admin:$OPENSEARCH_ADMIN_PASSWORD -X PUT \
   -d @scripts/index-templates/corex-log.json
 ```
 
-3. Use an [enrichment pipeline](https://docs.opensearch.org/latest/ingest-pipelines/processors/enrich/) to enrich the correlated documents with HAProxy fields (method, path, status, ASN, JA4) by looking up `unique_id` in `corex-log-*`.
+3. Use an [enrichment pipeline](https://docs.opensearch.org/latest/data-prepper/transform/) to enrich the correlated documents with HAProxy fields (method, path, status, ASN, JA4) by looking up `unique_id` in `corex-log-*`.
 
 4. Create a Dashboards index pattern for `corex-correlated` to visualize WAF rule hits with full request context.
 
 ## Troubleshooting
 
-### Vector not receiving HAProxy logs
+### No logs appearing in OpenSearch
 
-1. Verify the LogDestination was created: `curl -s http://localhost:8000/api/v1/log-destinations -H "Authorization: Bearer <token>" | python3 -m json.tool`
-2. Verify HAProxy config was applied (check the coreX UI for pending changes)
-3. Check Vector can resolve `vector` hostname from the corex container: `docker exec corex getent hosts vector`
-4. Check Vector is listening on port 601: `docker exec -it <vector-container> netstat -ulnp | grep 514`
+Vector (now in coreX Manager) ships logs into this OpenSearch instance. If no documents are appearing:
 
-### Vector not receiving WAF logs
-
-1. Verify the `haproxy-data` volume is mounted read-only in Vector: `docker exec <vector-container> ls -la /app/data/coraza-spoa.log`
-2. Verify the WAF log file exists: it may not exist if no WAF events have been logged yet
-3. Check Vector file source logs: `docker compose logs vector | grep waf_file`
+1. Verify this stack is up and OpenSearch is healthy: `docker compose ps` and `docker compose logs opensearch`
+2. Verify Vector in coreX Manager is configured to ship to this OpenSearch (`opensearch:9200` on the shared network, with the correct admin password)
+3. Check the coreX Manager Vector logs for sink/transport errors
 
 ### OpenSearch health check fails
 
@@ -407,18 +321,16 @@ This setup uses OpenSearch's bundled demo certificates (`esnode.pem`, `root-ca.p
 
 ```
 corex-logging/
-├── docker-compose.yml          # OpenSearch + Dashboards + Vector services
-├── .env.example                # Config template (passwords, network/volume names)
+├── docker-compose.yml          # OpenSearch + Dashboards services
+├── .env.example                # Config template (passwords, volume names)
 ├── README.md                   # This file
-├── vector/
-│   └── vector.toml             # Vector config: sources, VRL transforms, sinks
-├── opensearch/
-│   └── opensearch.yml          # OpenSearch single-node config with demo certs
+├── opensearch-dashboards/
+│   └── opensearch_dashboards.yml # Dashboards config (connects to OpenSearch)
 └── scripts/
     ├── setup-opensearch.sh     # Create index templates + Dashboards patterns + dashboards
     ├── setup-dashboards.py     # Create saved searches, visualizations, and dashboards
-    ├── create-logdestination.sh # (optional) Script to create LogDestination via coreX API
+    ├── delete-dashboards-objects.py # Remove saved objects created by setup-dashboards.py
     └── index-templates/
-        ├── corex-log.json   # OpenSearch index template for HAProxy logs
-        └── waf-logs.json       # OpenSearch index template for WAF logs
+        ├── corex-log.json      # OpenSearch index template for HAProxy logs
+        └── waf-logs.json        # OpenSearch index template for WAF logs
 ```

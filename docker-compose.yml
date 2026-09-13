@@ -44,28 +44,9 @@ services:
     networks:
       - logging-net
 
-  vector:
-    image: timberio/vector:0.58.0-alpine
-    command: ["--config", "/etc/vector/vector.toml", "--dangerously-allow-env-var-interpolation"]
-    volumes:
-      - ./vector/vector.toml:/etc/vector/vector.toml:ro
-      - ${HAPROXY_DATA_DIR:-./data/haproxy}:/app/data:ro
-    environment:
-      - OPENSEARCH_ADMIN_PASSWORD=${OPENSEARCH_ADMIN_PASSWORD}
-    depends_on:
-      opensearch:
-        condition: service_healthy
-    restart: unless-stopped
-    networks:
-      - logging-net
-      - corex-net
-
 networks:
   logging-net:
     driver: bridge
-  corex-net:
-    external: true
-    name: ${COREX_NETWORK_NAME:-corex_manager_corex-net}
 
 volumes:
   opensearch-data:
