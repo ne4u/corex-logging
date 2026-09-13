@@ -275,10 +275,10 @@ The MCP Gateway emits one JSON audit event per request, with fields for the call
 | `error` | Error message (null when status is `ok`) | `null` |
 | `bytes_in` | Request payload size in bytes (long) | `51` |
 | `bytes_out` | Response payload size in bytes (long) | `1096` |
-| `dlp_hits` | DLP (Data Loss Prevention) rule hits (flattened object, null when none) | `null` |
-| `guardrail_hits` | Guardrail rule hits (flattened object, null when none) | `null` |
+| `dlp_hits` | DLP (Data Loss Prevention) rule hits (object, null when none) | `null` |
+| `guardrail_hits` | Guardrail rule hits (object, null when none) | `null` |
 
-The `dlp_hits` and `guardrail_hits` fields use the OpenSearch `flattened` type, so any sub-field within them is queryable as a keyword (e.g., `dlp_hits.rule_name: "ssn"`). They are `null` when no DLP or guardrail rules were triggered.
+The `dlp_hits` and `guardrail_hits` fields use the OpenSearch `object` type with dynamic mapping, so sub-fields are automatically mapped and queryable (e.g., `dlp_hits.rule_name: "ssn"`) once documents with those fields are ingested. They are `null` when no DLP or guardrail rules were triggered. Until documents with non-null DLP/guardrail hits are ingested, these fields won't appear in the Dashboards field list — re-run `setup-dashboards.py` after such data arrives to refresh the field cache.
 
 ## Services
 

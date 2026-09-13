@@ -27,8 +27,8 @@
         "error": { "type": "text", "fields": { "keyword": { "type": "keyword", "ignore_above": 256 } } },
         "bytes_in": { "type": "long" },
         "bytes_out": { "type": "long" },
-        "dlp_hits": { "type": "flattened" },
-        "guardrail_hits": { "type": "flattened" }
+        "dlp_hits": { "type": "object", "dynamic": true },
+        "guardrail_hits": { "type": "object", "dynamic": true }
       }
     }
   }

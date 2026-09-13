@@ -13,7 +13,6 @@ queries Dashboards for the existing index pattern IDs, then creates:
     - Request Correlation (HAProxy + WAF)
     - MCP Gateway Errors
     - MCP Gateway Denied
-    - MCP Gateway DLP/Guardrail Hits
     - MCP Gateway Slow Requests (>1s)
 
   Visualizations (HAProxy):
@@ -480,9 +479,6 @@ def main():
                         'status: "error"', mcp_pattern_id)
     create_saved_search("MCP Gateway Denied", "MCP Gateway requests that were denied",
                         'action: "deny"', mcp_pattern_id)
-    create_saved_search("MCP Gateway DLP/Guardrail Hits",
-                        "MCP Gateway requests that triggered DLP or guardrail rules",
-                        "dlp_hits: * or guardrail_hits: *", mcp_pattern_id)
     create_saved_search("MCP Gateway Slow Requests (>1s)",
                         "MCP Gateway requests with latency > 1000ms",
                         "latency_ms > 1000", mcp_pattern_id)
