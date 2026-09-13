@@ -1,0 +1,35 @@
+{
+  "index_patterns": ["mcp-gateway-logs-*"],
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0,
+      "index.refresh_interval": "5s"
+    },
+    "mappings": {
+      "properties": {
+        "@timestamp": { "type": "date" },
+        "request_id": { "type": "keyword" },
+        "session_id": { "type": "keyword" },
+        "identity_id": { "type": "integer" },
+        "identity_name": { "type": "keyword" },
+        "team_id": { "type": "integer" },
+        "team_name": { "type": "keyword" },
+        "server_id": { "type": "integer" },
+        "server_name": { "type": "keyword" },
+        "method": { "type": "keyword" },
+        "tool": { "type": "keyword" },
+        "resource_uri": { "type": "text", "fields": { "keyword": { "type": "keyword", "ignore_above": 1024 } } },
+        "prompt": { "type": "text", "fields": { "keyword": { "type": "keyword", "ignore_above": 512 } } },
+        "action": { "type": "keyword" },
+        "status": { "type": "keyword" },
+        "latency_ms": { "type": "integer" },
+        "error": { "type": "text", "fields": { "keyword": { "type": "keyword", "ignore_above": 256 } } },
+        "bytes_in": { "type": "long" },
+        "bytes_out": { "type": "long" },
+        "dlp_hits": { "type": "flattened" },
+        "guardrail_hits": { "type": "flattened" }
+      }
+    }
+  }
+}

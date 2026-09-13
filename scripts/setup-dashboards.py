@@ -11,6 +11,10 @@ queries Dashboards for the existing index pattern IDs, then creates:
     - WAF Blocked Requests
     - Security Rule Hits
     - Request Correlation (HAProxy + WAF)
+    - MCP Gateway Errors
+    - MCP Gateway Denied
+    - MCP Gateway DLP/Guardrail Hits
+    - MCP Gateway Slow Requests (>1s)
 
   Visualizations (HAProxy):
     - Requests Over Time (area chart, split by status)
@@ -26,9 +30,21 @@ queries Dashboards for the existing index pattern IDs, then creates:
     - WAF Actions (pie)
     - Top WAF Client IPs (table)
 
+  Visualizations (MCP Gateway):
+    - MCP Requests Over Time (area, split by method)
+    - MCP Method Distribution (pie)
+    - MCP Action Distribution (pie)
+    - MCP Status Distribution (pie)
+    - Top MCP Tools (table)
+    - Top MCP Servers (table)
+    - Top MCP Identities (table)
+    - MCP Avg Latency (line)
+    - MCP Latency by Tool (bar)
+
   Dashboards:
     - CoreX HAProxy Overview (6 panels)
     - CoreX WAF Overview (4 panels)
+    - MCP Gateway Overview (9 panels)
 
 Usage:
   OPENSEARCH_ADMIN_PASSWORD=YourPassword ./scripts/setup-dashboards.py
@@ -406,6 +422,7 @@ def main():
     print("Finding index patterns...")
     corex_pattern_id = find_index_pattern("corex-log-*")
     waf_pattern_id = find_index_pattern("waf-logs-*")
+    mcp_pattern_id = find_index_pattern("mcp-gateway-logs-*")
 
     if not corex_pattern_id:
         print("ERROR: index pattern 'corex-log-*' not found. Run setup-opensearch.sh first.",
@@ -415,9 +432,14 @@ def main():
         print("ERROR: index pattern 'waf-logs-*' not found. Run setup-opensearch.sh first.",
               file=sys.stderr)
         sys.exit(1)
+    if not mcp_pattern_id:
+        print("ERROR: index pattern 'mcp-gateway-logs-*' not found. Run setup-opensearch.sh first.",
+              file=sys.stderr)
+        sys.exit(1)
 
     print(f"  corex-log-* -> {corex_pattern_id}")
     print(f"  waf-logs-* -> {waf_pattern_id}")
+    print(f"  mcp-gateway-logs-* -> {mcp_pattern_id}")
 
     combined_pattern_id = find_index_pattern("corex-log-*,waf-logs-*")
     if combined_pattern_id:
@@ -435,6 +457,7 @@ def main():
     print("\nPopulating index pattern fields...")
     for title, pid in [("corex-log-*", corex_pattern_id),
                        ("waf-logs-*", waf_pattern_id),
+                       ("mcp-gateway-logs-*", mcp_pattern_id),
                        ("corex-log-*,waf-logs-*", combined_pattern_id)]:
         if pid:
             ok = populate_index_pattern_fields(title, pid)
@@ -451,6 +474,18 @@ def main():
                         'action: "denied" or action: "blocked"', waf_pattern_id)
     create_saved_search("Security Rule Hits", "Requests that triggered security rules",
                         "sec_rule: *", corex_pattern_id)
+
+    # MCP Gateway saved searches
+    create_saved_search("MCP Gateway Errors", "MCP Gateway requests with error status",
+                        'status: "error"', mcp_pattern_id)
+    create_saved_search("MCP Gateway Denied", "MCP Gateway requests that were denied",
+                        'action: "deny"', mcp_pattern_id)
+    create_saved_search("MCP Gateway DLP/Guardrail Hits",
+                        "MCP Gateway requests that triggered DLP or guardrail rules",
+                        "dlp_hits: * or guardrail_hits: *", mcp_pattern_id)
+    create_saved_search("MCP Gateway Slow Requests (>1s)",
+                        "MCP Gateway requests with latency > 1000ms",
+                        "latency_ms > 1000", mcp_pattern_id)
 
     # Correlation saved search — spans both indices, sorted by timestamp
     if combined_pattern_id:
@@ -525,6 +560,60 @@ def main():
                                   "orderBy": "1", "customLabel": "Client IP"}}],
         _TABLE_PARAMS, waf_pattern_id)
 
+    # ---- MCP Gateway Visualizations ----
+    print("\nCreating MCP Gateway visualizations...")
+    v_mcp_time = create_viz(
+        "MCP Requests Over Time", "area",
+        [agg_count(), agg_date_histogram("2", "@timestamp"),
+         {**agg_terms("3", "method", size=10, schema="group")}],
+        _AREA_PARAMS, mcp_pattern_id)
+
+    v_mcp_methods = create_viz(
+        "MCP Method Distribution", "pie",
+        [agg_count(), agg_terms("2", "method", size=10)],
+        _PIE_PARAMS, mcp_pattern_id)
+
+    v_mcp_actions = create_viz(
+        "MCP Action Distribution", "pie",
+        [agg_count(), agg_terms("2", "action", size=10)],
+        _PIE_PARAMS, mcp_pattern_id)
+
+    v_mcp_status = create_viz(
+        "MCP Status Distribution", "pie",
+        [agg_count(), agg_terms("2", "status", size=10)],
+        _PIE_PARAMS, mcp_pattern_id)
+
+    v_mcp_tools = create_viz(
+        "Top MCP Tools", "table",
+        [agg_count(), {**agg_terms("2", "tool", size=20, schema="bucket"),
+                       "params": {"field": "tool", "size": 20, "order": "desc",
+                                  "orderBy": "1", "customLabel": "Tool"}}],
+        _TABLE_PARAMS, mcp_pattern_id)
+
+    v_mcp_servers = create_viz(
+        "Top MCP Servers", "table",
+        [agg_count(), {**agg_terms("2", "server_name", size=20, schema="bucket"),
+                       "params": {"field": "server_name", "size": 20, "order": "desc",
+                                  "orderBy": "1", "customLabel": "Server"}}],
+        _TABLE_PARAMS, mcp_pattern_id)
+
+    v_mcp_identities = create_viz(
+        "Top MCP Identities", "table",
+        [agg_count(), {**agg_terms("2", "identity_name", size=20, schema="bucket"),
+                       "params": {"field": "identity_name", "size": 20, "order": "desc",
+                                  "orderBy": "1", "customLabel": "Identity"}}],
+        _TABLE_PARAMS, mcp_pattern_id)
+
+    v_mcp_latency = create_viz(
+        "MCP Avg Latency", "line",
+        [agg_avg("1", "latency_ms"), agg_date_histogram("2", "@timestamp")],
+        _LINE_PARAMS, mcp_pattern_id)
+
+    v_mcp_latency_tool = create_viz(
+        "MCP Latency by Tool", "histogram",
+        [agg_avg("1", "latency_ms"), agg_terms("2", "tool", size=15)],
+        _BAR_PARAMS, mcp_pattern_id)
+
     # ---- Dashboards ----
     print("\nCreating dashboards...")
 
@@ -568,6 +657,35 @@ def main():
         for i, vid in enumerate([v_waf_time, v_waf_messages, v_waf_actions, v_waf_ips])
     ]
     create_dashboard("CoreX WAF Overview", waf_panels, waf_refs)
+
+    # MCP Gateway Overview — 9 panels in a 48-col grid
+    mcp_panels = [
+        {"panelIndex": 1, "gridData": {"x": 0, "y": 0, "w": 48, "h": 8, "i": "1"},
+         "type": "visualization", "panelRefName": "panel_1", "version": "3.0.0"},
+        {"panelIndex": 2, "gridData": {"x": 0, "y": 8, "w": 16, "h": 8, "i": "2"},
+         "type": "visualization", "panelRefName": "panel_2", "version": "3.0.0"},
+        {"panelIndex": 3, "gridData": {"x": 16, "y": 8, "w": 16, "h": 8, "i": "3"},
+         "type": "visualization", "panelRefName": "panel_3", "version": "3.0.0"},
+        {"panelIndex": 4, "gridData": {"x": 32, "y": 8, "w": 16, "h": 8, "i": "4"},
+         "type": "visualization", "panelRefName": "panel_4", "version": "3.0.0"},
+        {"panelIndex": 5, "gridData": {"x": 0, "y": 16, "w": 24, "h": 8, "i": "5"},
+         "type": "visualization", "panelRefName": "panel_5", "version": "3.0.0"},
+        {"panelIndex": 6, "gridData": {"x": 24, "y": 16, "w": 24, "h": 8, "i": "6"},
+         "type": "visualization", "panelRefName": "panel_6", "version": "3.0.0"},
+        {"panelIndex": 7, "gridData": {"x": 0, "y": 24, "w": 16, "h": 8, "i": "7"},
+         "type": "visualization", "panelRefName": "panel_7", "version": "3.0.0"},
+        {"panelIndex": 8, "gridData": {"x": 16, "y": 24, "w": 16, "h": 8, "i": "8"},
+         "type": "visualization", "panelRefName": "panel_8", "version": "3.0.0"},
+        {"panelIndex": 9, "gridData": {"x": 32, "y": 24, "w": 16, "h": 8, "i": "9"},
+         "type": "visualization", "panelRefName": "panel_9", "version": "3.0.0"},
+    ]
+    mcp_refs = [
+        {"name": f"panel_{i+1}", "type": "visualization", "id": vid}
+        for i, vid in enumerate([v_mcp_time, v_mcp_methods, v_mcp_actions,
+                                 v_mcp_status, v_mcp_latency, v_mcp_latency_tool,
+                                 v_mcp_tools, v_mcp_servers, v_mcp_identities])
+    ]
+    create_dashboard("MCP Gateway Overview", mcp_panels, mcp_refs)
 
     print("\nDashboard setup complete!")
     print(f"  Dashboards URL: {DASH_HOST}/app/dashboards")

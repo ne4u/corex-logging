@@ -37,6 +37,12 @@ curl -sk --user "${OS_USER}:${OS_PASS}" -X PUT \
   -H 'Content-Type: application/json' \
   -d @"${SCRIPT_DIR}/index-templates/waf-logs.json" | python3 -c "import sys,json; r=json.load(sys.stdin); print('  acknowledged:', r.get('acknowledged', r))"
 
+echo "Creating index template: mcp-gateway-logs..."
+curl -sk --user "${OS_USER}:${OS_PASS}" -X PUT \
+  "${OS_HOST}/_index_template/mcp-gateway-logs" \
+  -H 'Content-Type: application/json' \
+  -d @"${SCRIPT_DIR}/index-templates/mcp-gateway-logs.json" | python3 -c "import sys,json; r=json.load(sys.stdin); print('  acknowledged:', r.get('acknowledged', r))"
+
 echo ""
 echo "Waiting for OpenSearch Dashboards to be ready..."
 until curl -s --user "${OS_USER}:${OS_PASS}" "${DASH_HOST}/api/status" 2>/dev/null | grep -q '"state":"green"'; do
@@ -82,6 +88,9 @@ find_or_create_index_pattern "corex-log-*"
 echo "Creating Dashboards index pattern: waf-logs-*..."
 find_or_create_index_pattern "waf-logs-*"
 
+echo "Creating Dashboards index pattern: mcp-gateway-logs-*..."
+find_or_create_index_pattern "mcp-gateway-logs-*"
+
 echo "Creating Dashboards index pattern: corex-log-*,waf-logs-* (combined for correlation)..."
 find_or_create_index_pattern "corex-log-*,waf-logs-*"
 
@@ -96,4 +105,5 @@ echo "  OpenSearch:       ${OS_HOST}"
 echo "  Dashboards:       ${DASH_HOST}"
 echo "  HAProxy index:    corex-log-*"
 echo "  WAF index:        waf-logs-*"
-echo "  Dashboards:       CoreX HAProxy Overview, CoreX WAF Overview"
+echo "  MCP Gateway index: mcp-gateway-logs-*"
+echo "  Dashboards:       CoreX HAProxy Overview, CoreX WAF Overview, MCP Gateway Overview"

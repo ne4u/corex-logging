@@ -44,9 +44,43 @@ services:
     networks:
       - logging-net
 
+  opensearch-mcp:
+    container_name: opensearch-mcp
+    hostname: opensearch-mcp
+    image: opensearch-mcp:0.11.0
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM python:3.13-slim
+        RUN pip install --no-cache-dir opensearch-mcp-server-py==0.11.0
+        ENTRYPOINT ["python", "-m", "mcp_server_opensearch"]
+    command: --transport stream --host 0.0.0.0 --port 9900 --log-format json --debug
+    env_file: [.env]
+    environment:
+      - OPENSEARCH_URL=${OPENSEARCH_URL:-https://opensearch:9200}
+      - OPENSEARCH_USERNAME=${OPENSEARCH_USERNAME:-admin}
+      - OPENSEARCH_PASSWORD=${OPENSEARCH_ADMIN_PASSWORD}
+      - OPENSEARCH_SETTINGS_ALLOW_WRITE=false
+      - OPENSEARCH_SSL_VERIFY=false
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import socket; s=socket.create_connection(('localhost', 9900), timeout=3); s.close()\""]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - logging-net
+      - corex-net
+
 networks:
   logging-net:
     driver: bridge
+  corex-net:
+    external: true
+    name: ${COREX_NETWORK_NAME:-haproxy_manager_corex-net}
 
 volumes:
   opensearch-data:

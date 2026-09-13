@@ -1,10 +1,10 @@
 # coreX Logging Pipeline
 
-OpenSearch + OpenSearch Dashboards for HAProxy + WAF logs, using Docker Compose.
+OpenSearch + OpenSearch Dashboards + OpenSearch MCP server for HAProxy + WAF + MCP Gateway logs, using Docker Compose.
 
-This is a standalone project that runs alongside the [coreX Manager](https://github.com/akauffman/corex_manager) stack. It provides the OpenSearch storage and Dashboards UI for HAProxy request logs and WAF (Coraza SPOA) logs.
+This is a standalone project that runs alongside the [coreX Manager](https://github.com/akauffman/corex_manager) stack. It provides the OpenSearch storage, Dashboards UI, and an OpenSearch MCP server (tool interface for querying logs) for HAProxy request logs, WAF (Coraza SPOA) logs, and MCP Gateway audit logs.
 
-> **Note:** The [Vector](https://vector.dev) log collector that ships logs from HAProxy/Coraza into OpenSearch is now part of coreX Manager. This repo no longer runs a Vector service — it only provides OpenSearch and OpenSearch Dashboards. See the coreX Manager stack for Vector configuration, sources, VRL transforms, and HAProxy LogDestination setup.
+> **Note:** The [Vector](https://vector.dev) log collector that ships logs from HAProxy/Coraza/MCP Gateway into OpenSearch is now part of coreX Manager. This repo no longer runs a Vector service — it only provides OpenSearch, OpenSearch Dashboards, and the OpenSearch MCP server. See the coreX Manager stack for Vector configuration, sources, VRL transforms, and HAProxy LogDestination setup.
 
 ## Architecture
 
@@ -15,20 +15,31 @@ corex_manager stack                          corex-logging stack
 │ (corex)  │   │ (corex) │                │ haproxy-*  │
 └──────────┘   └─────────┘                ├────────────┤
 ┌──────────┐      │                       │ waf-logs-* │
-│ Coraza   │ ─────┘                       └────────────┤
-│ SPOA     │                                  │
-└──────────┘                               ┌────────────┐
-                                           │ Dashboards │
-                                           │ :5601      │
-                                           └────────────┘
+│ Coraza   │ ─────┘                       ├────────────┤
+│ SPOA     │                              │ mcp-       │
+└──────────┘                              │ gateway-*  │
+┌──────────┐   ┌─────────┐                │            │
+│ MCP      │   │ Vector  │ ─────────────> │            │
+│ Gateway  │   │ (corex) │                └────────────┤
+└──────────┘   └─────────┘                  │
+                                          ┌────────────┐
+                                          │ Dashboards │
+                                          │ :5601      │
+                                          └────────────┘
+                                          ┌────────────┐
+┌──────────┐                              │ OpenSearch │
+│ MCP      │  <──── corex-net ──────────> │ MCP Server │
+│ clients  │                              │ :9900      │
+└──────────┘                              └────────────┘
 ```
 
 | Log type | Source | OpenSearch Index |
 |----------|--------|------------------|
 | HAProxy request logs | HAProxy `log` directive (syslog, collected by Vector in coreX Manager) | `corex-log-YYYY.MM.DD` |
 | WAF (Coraza SPOA) logs | `/app/data/coraza-spoa.log` file (tailed by Vector in coreX Manager) | `waf-logs-YYYY.MM.DD` |
+| MCP Gateway audit logs | MCP Gateway audit log (collected by Vector in coreX Manager) | `mcp-gateway-logs-YYYY.MM.DD` |
 
-Vector (in coreX Manager) collects HAProxy request logs via syslog and WAF (Coraza SPOA) logs via file tailing, decodes JA4 TLS fingerprints, request fingerprints (req_fp), and unique request IDs into structured sub-fields, and ships them to two separate OpenSearch indices in this stack.
+Vector (in coreX Manager) collects HAProxy request logs via syslog, WAF (Coraza SPOA) logs via file tailing, and MCP Gateway audit logs, decodes JA4 TLS fingerprints, request fingerprints (req_fp), and unique request IDs into structured sub-fields, and ships them to separate OpenSearch indices in this stack.
 
 ## Prerequisites
 
@@ -60,15 +71,27 @@ mkdir -p /mnt/nsf-volume/opensearch
 chown 1000:1000 /mnt/nsf-volume/opensearch
 ```
 
+The `opensearch-mcp` service joins the external `corex-net` network so coreX Manager and other MCP clients can reach it. If your coreX Manager deployment uses a non-default Docker Compose project name, update `COREX_NETWORK_NAME` in `.env` to match the external network name:
+
+```env
+COREX_NETWORK_NAME=haproxy_manager_corex-net
+```
+
+You can verify the network name with:
+```bash
+docker network ls | grep corex-net
+```
+
 ### 2. Start the logging stack
 
 ```bash
 docker compose up -d
 ```
 
-This starts two services:
+This starts three services:
 - **opensearch** — single-node OpenSearch with security plugin (demo certs), port 9200
 - **opensearch-dashboards** — OpenSearch Dashboards UI, port 5601
+- **opensearch-mcp** — OpenSearch MCP server (streamable HTTP transport), port 9900; joins both `logging-net` (to reach OpenSearch) and `corex-net` (so coreX Manager / MCP clients can reach it)
 
 Wait for OpenSearch to become healthy:
 ```bash
@@ -83,11 +106,11 @@ OPENSEARCH_ADMIN_PASSWORD=YourPassword ./scripts/setup-opensearch.sh
 ```
 
 This creates:
-- OpenSearch index templates for `corex-log-*` and `waf-logs-*` with explicit field mappings (JA4 sub-fields, req_fp sub-fields, IP types, etc.)
-- Dashboards index patterns so the Discover UI can browse both indices
-- Saved searches: "4xx/5xx Errors", "Slow Requests (>1s)", "WAF Blocked Requests", "Security Rule Hits"
-- Visualizations: requests over time, status code distribution, top client IPs, top ASN organizations, top request paths, avg response time, WAF events over time, WAF events by message, WAF actions, top WAF client IPs
-- Dashboards: "CoreX HAProxy Overview" (6 panels) and "CoreX WAF Overview" (4 panels)
+- OpenSearch index templates for `corex-log-*`, `waf-logs-*`, and `mcp-gateway-logs-*` with explicit field mappings (JA4 sub-fields, req_fp sub-fields, IP types, MCP Gateway audit fields, etc.)
+- Dashboards index patterns so the Discover UI can browse all indices
+- Saved searches: "4xx/5xx Errors", "Slow Requests (>1s)", "WAF Blocked Requests", "Security Rule Hits", "MCP Gateway Errors", "MCP Gateway Denied", "MCP Gateway DLP/Guardrail Hits", "MCP Gateway Slow Requests (>1s)"
+- Visualizations: requests over time, status code distribution, top client IPs, top ASN organizations, top request paths, avg response time, WAF events over time, WAF events by message, WAF actions, top WAF client IPs, MCP requests over time, MCP method/action/status distribution, top MCP tools/servers/identities, MCP avg latency, MCP latency by tool
+- Dashboards: "CoreX HAProxy Overview" (6 panels), "CoreX WAF Overview" (4 panels), and "MCP Gateway Overview" (9 panels)
 
 ### 4. Verify data in OpenSearch
 
@@ -102,13 +125,16 @@ curl -sku admin:$OPENSEARCH_ADMIN_PASSWORD https://localhost:9200/corex-log-*/_s
 
 # Check WAF log count (generate WAF traffic first by triggering a Coraza rule)
 curl -sku admin:$OPENSEARCH_ADMIN_PASSWORD https://localhost:9200/waf-logs-*/_count
+
+# Check MCP Gateway log count
+curl -sku admin:$OPENSEARCH_ADMIN_PASSWORD https://localhost:9200/mcp-gateway-logs-*/_count
 ```
 
 ### 5. Open OpenSearch Dashboards
 
 Navigate to `http://localhost:5601` and log in with `admin` / your `OPENSEARCH_ADMIN_PASSWORD`.
 
-Go to **Discover** and select the `corex-log-*` or `waf-logs-*` index pattern to browse logs. The decoded JA4 sub-fields (`ja4_proto`, `ja4_version`, `ja4_sni`, etc.) and req_fp sub-fields (`req_fp_method`, `req_fp_path_depth`, `req_fp_hdr_count`, etc.) are available as searchable columns.
+Go to **Discover** and select the `corex-log-*`, `waf-logs-*`, or `mcp-gateway-logs-*` index pattern to browse logs. The decoded JA4 sub-fields (`ja4_proto`, `ja4_version`, `ja4_sni`, etc.) and req_fp sub-fields (`req_fp_method`, `req_fp_path_depth`, `req_fp_hdr_count`, etc.) are available as searchable columns in the HAProxy index. MCP Gateway audit fields (`method`, `tool`, `action`, `status`, `latency_ms`, etc.) are available in the MCP Gateway index.
 
 ## Decoded Fields
 
@@ -224,12 +250,58 @@ In addition to the core request fields, HAProxy emits the following HTTP headers
 | `xff` | Full `X-Forwarded-For` header chain as received from the client/upstream proxy | `203.0.113.195, 198.51.100.42` |
 | `referer` | `Referer` HTTP header (the full URL/URI the request came from, when present) | `https://example.com/page` |
 
+### MCP Gateway audit fields
+
+The MCP Gateway emits one JSON audit event per request, with fields for the calling identity, target server, MCP method, and authorization/guardrail outcomes. These fields are available in the `mcp-gateway-logs-*` index:
+
+| Field | Description | Example |
+|-------|-------------|---------|
+| `@timestamp` | Event timestamp (ISO 8601 with nanosecond precision) | `2026-09-13T02:41:26.006727176+00:00` |
+| `request_id` | Unique request identifier (16-char hex) | `e76c9edc36774adf` |
+| `session_id` | MCP session identifier | `R3AvIq9SXgR4hE2h7-1vZJ2Df7GQxDrpo-BhqhjLJMM` |
+| `identity_id` | Calling identity ID (integer) | `2` |
+| `identity_name` | Calling identity name | `grok-agent` |
+| `team_id` | Calling team ID (integer) | `2` |
+| `team_name` | Calling team name | `platform` |
+| `server_id` | Target MCP server ID (integer) | `3` |
+| `server_name` | Target MCP server name | `corex-manager` |
+| `method` | MCP method | `tools/call` |
+| `tool` | Tool name (for `tools/call`), format `server__tool` | `corex-manager__list_users` |
+| `resource_uri` | Resource URI (for `resources/read`), null otherwise | `null` |
+| `prompt` | Prompt name (for `prompts/get`), null otherwise | `null` |
+| `action` | Authorization decision | `allow` or `deny` |
+| `status` | Request outcome | `ok` or `error` |
+| `latency_ms` | Request latency in milliseconds (integer) | `395` |
+| `error` | Error message (null when status is `ok`) | `null` |
+| `bytes_in` | Request payload size in bytes (long) | `51` |
+| `bytes_out` | Response payload size in bytes (long) | `1096` |
+| `dlp_hits` | DLP (Data Loss Prevention) rule hits (flattened object, null when none) | `null` |
+| `guardrail_hits` | Guardrail rule hits (flattened object, null when none) | `null` |
+
+The `dlp_hits` and `guardrail_hits` fields use the OpenSearch `flattened` type, so any sub-field within them is queryable as a keyword (e.g., `dlp_hits.rule_name: "ssn"`). They are `null` when no DLP or guardrail rules were triggered.
+
 ## Services
 
 | Service | Port | Description |
 |---------|------|-------------|
 | OpenSearch | 9200 | Search engine API (HTTPS) |
 | OpenSearch Dashboards | 5601 | Web UI for querying and visualizing logs |
+| OpenSearch MCP Server | 9900 | MCP server exposing OpenSearch as a tool (streamable HTTP, read-only) |
+
+## OpenSearch MCP Server
+
+The `opensearch-mcp` service exposes OpenSearch as an [MCP](https://modelcontextprotocol.io/) tool server using the [opensearch-mcp-server-py](https://pypi.org/project/opensearch-mcp-server-py/) package. It runs on port 9900 with the streamable HTTP transport and is configured read-only (`OPENSEARCH_SETTINGS_ALLOW_WRITE=false`) so MCP clients can search and inspect logs but cannot modify indices or settings.
+
+The service joins two Docker networks:
+- **`logging-net`** — to reach the `opensearch` service (`OPENSEARCH_URL=https://opensearch:9200`)
+- **`corex-net`** (external, `haproxy_manager_corex-net`) — so coreX Manager and other MCP clients on the coreX network can reach it at `opensearch-mcp:9900`
+
+To register the OpenSearch MCP server as a tool in coreX Manager, point the MCP client at:
+```
+http://opensearch-mcp:9900
+```
+
+Authentication uses the same `OPENSEARCH_ADMIN_PASSWORD` as the rest of the stack (mapped to `OPENSEARCH_PASSWORD` for the MCP server) with username `admin`. TLS verification is disabled (`OPENSEARCH_SSL_VERIFY=false`) because OpenSearch uses bundled demo certificates.
 
 ## Log Correlation
 
@@ -321,8 +393,8 @@ This setup uses OpenSearch's bundled demo certificates (`esnode.pem`, `root-ca.p
 
 ```
 corex-logging/
-├── docker-compose.yml          # OpenSearch + Dashboards services
-├── .env.example                # Config template (passwords, volume names)
+├── docker-compose.yml          # OpenSearch + Dashboards + OpenSearch MCP server
+├── .env.example                # Config template (passwords, network/volume names)
 ├── README.md                   # This file
 ├── opensearch-dashboards/
 │   └── opensearch_dashboards.yml # Dashboards config (connects to OpenSearch)
@@ -332,5 +404,6 @@ corex-logging/
     ├── delete-dashboards-objects.py # Remove saved objects created by setup-dashboards.py
     └── index-templates/
         ├── corex-log.json      # OpenSearch index template for HAProxy logs
-        └── waf-logs.json        # OpenSearch index template for WAF logs
+        ├── waf-logs.json       # OpenSearch index template for WAF logs
+        └── mcp-gateway-logs.json # OpenSearch index template for MCP Gateway logs
 ```
