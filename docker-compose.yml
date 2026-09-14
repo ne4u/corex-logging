@@ -62,6 +62,8 @@ services:
       - OPENSEARCH_PASSWORD=${OPENSEARCH_ADMIN_PASSWORD}
       - OPENSEARCH_SETTINGS_ALLOW_WRITE=false
       - OPENSEARCH_SSL_VERIFY=false
+    ports:
+      - "9900:9900"
     depends_on:
       opensearch:
         condition: service_healthy
@@ -73,14 +75,11 @@ services:
     restart: unless-stopped
     networks:
       - logging-net
-      - corex-net
+
 
 networks:
   logging-net:
     driver: bridge
-  corex-net:
-    external: true
-    name: ${COREX_NETWORK_NAME:-haproxy_manager_corex-net}
 
 volumes:
   opensearch-data:
